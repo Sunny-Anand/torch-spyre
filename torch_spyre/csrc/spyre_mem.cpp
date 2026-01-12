@@ -661,12 +661,31 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 }
 
+at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    int64_t offset_increment) {
+  DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", self.device());
+  auto device_layout =
+      SpyreTensorLayout(size.vec(), c10::typeMetaToScalarType(self.dtype()));
+  auto self_ = at::detail::make_tensor_base<SpyreTensorImpl>(
+      self.storage(), self.key_set(), self.dtype(), device_layout);
+  auto* self_tmp_ = self_.unsafeGetTensorImpl();
+  self_tmp_->set_storage_offset(self.storage_offset() + offset_increment);
+  self_tmp_->set_sizes_and_strides(size, stride);
+  static_cast<SpyreTensorImpl*>(self_tmp_)->spyre_layout = device_layout;
+
+  DEBUGINFO("SpyreTensorLayout:", device_layout.toString());
+  return self_;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
+  m.impl("reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
 }
 
 }  // namespace spyre

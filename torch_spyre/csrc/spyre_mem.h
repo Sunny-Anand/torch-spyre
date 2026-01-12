@@ -35,4 +35,8 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
                                    SpyreTensorLayout device_layout);
+at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    int64_t offset_increment);
 }  // namespace spyre
