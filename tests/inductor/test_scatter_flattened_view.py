@@ -56,6 +56,7 @@ import unittest
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -170,11 +171,11 @@ class Test2DBase1DView(unittest.TestCase):
     directly-allocated 1-D tensor of 8192 bf16 elements fails with
     ``"restickify op_spec has 3 args"`` at the backend codegen stage.
 
-    ``@unittest.expectedFailure`` means:
+    ``@pytest.mark.xfail(strict=True)`` means:
       * while the hardware limit exists  → CI shows ``xfail`` (expected), green.
       * if the hardware gains element-scatter → the test passes the inner body,
-        ``expectedFailure`` sees an unexpected pass and marks it ``xpass``,
-        which is a CI signal to update or remove the decorator.
+        pytest sees an unexpected pass (XPASS) and fails the suite — that is
+        the signal to remove or update this decorator.
     """
 
     def _check(self, op_name, slots_name, dtype):
@@ -199,21 +200,21 @@ class Test2DBase1DView(unittest.TestCase):
         "subtest failed, turning strict xfail into an XPASS false-alarm)."
     )
 
-    @pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
+    @pytest.mark.xfail(raises=InductorError, strict=True, reason=_XFAIL_REASON)
     def test_bfloat16(self):
         """Known unsupported: element-scatter into a fully-flat 1-D view (bfloat16)."""
         for op in _OPERATIONS:
             for sl in _2D_SLOTS:
                 self._check(op, sl, torch.bfloat16)
 
-    @pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
+    @pytest.mark.xfail(raises=InductorError, strict=True, reason=_XFAIL_REASON)
     def test_float32(self):
         """Known unsupported: element-scatter into a fully-flat 1-D view (float32)."""
         for op in _OPERATIONS:
             for sl in _2D_SLOTS:
                 self._check(op, sl, torch.float32)
 
-    @pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
+    @pytest.mark.xfail(raises=InductorError, strict=True, reason=_XFAIL_REASON)
     def test_float16(self):
         """Known unsupported: element-scatter into a fully-flat 1-D view (float16)."""
         for op in _OPERATIONS:

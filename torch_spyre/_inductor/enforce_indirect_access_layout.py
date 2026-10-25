@@ -429,17 +429,12 @@ def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
 
     Unwraps MutableBox wrappers (TensorBox, StorageBox) and ReinterpretView
     chains to reach the underlying buffer, which carries the committed
-    FixedTiledLayout after finalize_layouts.
+    FixedTiledLayout after finalize_layouts.  A single loop handles arbitrary
+    interleaving of MutableBox and ReinterpretView wrappers.
     """
     assert isinstance(op.layout, MutationLayoutSHOULDREMOVE)
     target = op.layout.target
-    # Unwrap MutableBox wrappers (TensorBox, StorageBox) first, then
-    # ReinterpretView chains.  MutableBox.get_name() delegates correctly so
-    # target_name is stable; the loop is needed so target_buf.get_layout()
-    # returns the committed FixedTiledLayout rather than a view's FixedLayout.
-    while isinstance(target, MutableBox):
-        target = target.data
-    while isinstance(target, ReinterpretView):
+    while isinstance(target, (MutableBox, ReinterpretView)):
         target = target.data
     return target.get_name(), target
 

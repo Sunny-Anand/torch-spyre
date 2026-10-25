@@ -1,4 +1,4 @@
-# Copyright 2026 The Torch-Spyre Authors.
+# Copyright 2025 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ unique to the paged-cache usage pattern and not exercised elsewhere:
     buffer before the scatter.
 
   * test_view_backed_index_put_p1      — P=1 single-slot decode-step write
-    through a view; exercises the _p1_scatter_device_pos special-case path
-    in the scatter lowering, which is distinct from the multi-slot path.
+    through a view of a 4-D cache; end-to-end correctness check for the
+    single-slot case.
 """
 
 import torch
@@ -52,7 +52,12 @@ DEVICE = "spyre:0"
 
 
 def _run(kernel, cache, values, slots):
-    """Compile *kernel* on Spyre and assert it matches the CPU eager reference."""
+    """Compile *kernel* on Spyre and assert it matches the CPU eager reference.
+
+    Inputs are generated on CPU and transferred to device so that the reference
+    and compiled paths start from identical bit-patterns.  bfloat16 copies are
+    lossless (no rounding), so exact equality is required (atol=0, rtol=0).
+    """
     reference = kernel(
         cache.cpu().clone(),
         values.cpu().clone(),
@@ -60,7 +65,7 @@ def _run(kernel, cache, values, slots):
     )
     torch._dynamo.reset()
     result = torch.compile(kernel, dynamic=False)(cache, values, slots).cpu()
-    torch.testing.assert_close(result.float(), reference.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(result.float(), reference.float(), atol=0, rtol=0)
     return result, reference
 
 
@@ -80,11 +85,14 @@ class TestViewBackedKVCacheScatter:
         the relayout path introduced by the fix broke something.
         Note: the returned tensor is the cloned flat buffer, not the 4-D cache.
         """
-        torch.manual_seed(42)
+        rng = torch.Generator()
+        rng.manual_seed(42)
         cache = torch.zeros(
-            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, device=DEVICE
-        )
-        values = torch.randn((4, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, device=DEVICE)
+            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE
+        ).to(DEVICE)
+        values = torch.randn(
+            (4, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, generator=rng
+        ).to(DEVICE)
         slots = torch.tensor([47, 63, 80, 95], dtype=torch.int64, device=DEVICE)
 
         def kernel(cache, values, slots):
@@ -97,15 +105,17 @@ class TestViewBackedKVCacheScatter:
     def test_view_backed_index_put_p1(self):
         """P=1 single-slot write through a view of a 4-D cache (decode step).
 
-        The P=1 scatter path has special-casing in the lowering
-        (_p1_scatter_device_pos).  Verify it handles view-backed destinations,
-        not just directly-allocated tensors.
+        Exercises the single-slot index_put_ path end-to-end: a scalar slot
+        index writes one row into the flattened view of a small 4-D cache and
+        the written slot must contain the expected values after compilation.
         """
         nb, bs = 4, 16
-        cache = torch.zeros(
-            (nb, bs, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, device=DEVICE
-        )
-        values = torch.randn((1, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, device=DEVICE)
+        rng = torch.Generator()
+        rng.manual_seed(42)
+        cache = torch.zeros((nb, bs, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE).to(DEVICE)
+        values = torch.randn(
+            (1, NUM_KV_HEADS, HEAD_DIM), dtype=DTYPE, generator=rng
+        ).to(DEVICE)
         slots = torch.tensor([7], dtype=torch.int64, device=DEVICE)
 
         def kernel(cache, values, slots):

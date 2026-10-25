@@ -422,93 +422,120 @@ def _ia_rotate_stl(
 def _merge_device_dims_for_view(
     stl: SpyreTensorLayout, view_layout: FixedLayout
 ) -> SpyreTensorLayout:
-    """Merge non-stick device dims that ``view_layout`` presents as one.
+    """Merge non-stick device dims that ``view_layout`` collapses into one.
 
     ``stl`` is the destination buffer's device layout, expressed in the *base*
     buffer's host strides. A scatter through a flattening view (e.g. the 4-D
     paged KV cache ``[num_blocks, block_size, heads, head_dim]`` seen as
     ``[num_blocks*block_size, heads, head_dim]``) indexes a view dim whose
-    extent spans two (or more) base dims. Those base dims can map to any set of
-    non-adjacent device dims (e.g. ``device_size=[16, 8, 2, 512, 64]`` with
-    ``BLOCK_SIZE=16`` at pos 0 and ``NUM_BLOCKS=512`` at pos 3).
+    extent spans two (or more) base dims.  Those base dims can map to any set
+    of non-adjacent device positions (e.g. ``device_size=[16, 8, 2, 512, 64]``
+    with ``BLOCK_SIZE=16`` at pos 0 and ``NUM_BLOCKS=512`` at pos 3).
 
     Indirect access needs the scattered index in exactly one device dim, but
     with separate device dims the flat slot index is split across both.
-    This function iteratively merges pairs of non-stick device dims
-    ``(inner, outer)`` (inner has the smaller stride) where:
-      - ``stride_map[outer] == device_size[inner] * stride_map[inner]``
-        (the outer dim is the next "natural" stride after the inner dim), and
-      - no other non-stick device dim ``k`` has a stride strictly between
-        ``stride_map[inner]`` and ``stride_map[outer]`` (so no addressing
-        conflict is introduced), and
-      - the merged size ``device_size[inner]*device_size[outer]`` divides one
-        of the host dim sizes in ``view_layout`` — confirming this merge
-        corresponds to a flattening the view actually performs.
 
-    The divisibility check replaces the previous ``(size, host_stride) in
-    view_dims`` guard, which was a category error: device strides count sticks
-    whereas host strides count elements, so the two are only equal when
-    elems_per_stick==1.  Using just the host *sizes* from the view is correct
-    and handles fully-flat 1-D views (e.g. ``[M, N].view(-1)``) where the
-    only view dim has size ``M*N`` and stride 1.
+    **Algorithm — view-dim-at-a-time** (prevents cross-view-dim merges):
+
+    For each ``(want, sv)`` pair from ``view_layout`` (host size, host stride):
+
+    1. Build the set of *movable* (non-stick) device dims not yet claimed by a
+       previous view dim.
+    2. Walk outward from stride ``sv`` along host-contiguous chains:
+       - if ``sv == 1``: start at the stick dim (stride 1), treating
+         ``stick_size`` as the first partial product.
+       - otherwise: set ``product = 1``, ``next_stride = sv``.
+       - At each step find the unique movable dim ``d`` with
+         ``stride_map[d] == next_stride``; if none or more than one exists,
+         stop the chain.
+       - Accumulate: ``members.append(d)``, ``product *= device_size[d]``,
+         ``next_stride = product * sv`` (the expected stride of the next outer
+         level).
+       - Stop when ``product == want`` (exact match) or
+         ``product > want`` (over-shot, give up for this view dim).
+    3. If ``product == want`` and ``len(members) >= 2``: merge those non-stick
+       dims into a single dim (smallest stride wins as the representative;
+       the others are dropped).  Mark all members as claimed.
+
+    This guarantees that dims from *different* view dims are never merged, even
+    when their sizes happen to be divisors of another view dim's size.
 
     Only merges the view actually performs are applied; returns ``stl`` itself
     when there are none.
     """
     device_size = [int(s) for s in stl.device_size]
     stride_map = [int(s) for s in stl.stride_map]
-    # Stick dim is always last; skip it in merge candidates.
-    n_nonstick = len(device_size) - 1
-    # Only the host *sizes* of each view dim matter for merge validation.
-    # Comparing host (size, stride) pairs against device (size, stride) pairs
-    # is a category error: host strides count elements but device strides count
-    # sticks.  Instead we check that the merged device-dim product divides (or
-    # equals) one of the view's host dim sizes — which is sufficient to
-    # guarantee the merge only covers what the view actually collapses.
-    view_sizes = {int(concretize_expr(size)) for size in view_layout.size}
+    stick_pos = len(device_size) - 1
+    stick_size = device_size[stick_pos]
+    n_nonstick = stick_pos  # number of non-stick dims
 
-    merged_any = True
-    while merged_any:
-        merged_any = False
-        for inner in range(n_nonstick):
-            for outer in range(n_nonstick):
-                if inner == outer:
-                    continue
-                inner_stride = stride_map[inner]
-                outer_stride = stride_map[outer]
-                if outer_stride != device_size[inner] * inner_stride:
-                    continue
-                merged_size = device_size[inner] * device_size[outer]
-                # Accept the merge if the merged size divides one of the view's
-                # host dim sizes (including equality, which is the full-dim
-                # case).  This handles both partial-dim merges (merged_size is
-                # a factor of a view dim) and full-dim merges (merged_size ==
-                # view dim size), and the fully-flat 1-D case where we need to
-                # chain-merge all non-stick dims into one.
-                if not any(
-                    merged_size <= vs and vs % merged_size == 0 for vs in view_sizes
-                ):
-                    continue
-                # Ensure no other non-stick dim has a stride strictly between
-                # inner_stride and outer_stride (which would indicate an
-                # addressing conflict if these two were merged).
-                conflict = any(
-                    k != inner
-                    and k != outer
-                    and inner_stride < stride_map[k] < outer_stride
-                    for k in range(n_nonstick)
-                )
-                if conflict:
-                    continue
-                # Merge: replace outer dim's size into inner, remove outer.
-                device_size[inner] = merged_size
-                device_size.pop(outer)
-                stride_map.pop(outer)
-                n_nonstick -= 1
-                merged_any = True
-                break
-            if merged_any:
-                break
+    # Collect (host_size, host_stride) for each view dim.
+    view_dims = [
+        (int(concretize_expr(sz)), int(concretize_expr(st)))
+        for sz, st in zip(view_layout.size, view_layout.stride)
+    ]
+
+    # claimed[i] == True means non-stick dim i has already been assigned to a
+    # view dim and must not be considered again.
+    claimed = [False] * n_nonstick
+
+    # List of merge groups: each entry is a sorted list of non-stick positions
+    # to merge (inner-most stride first).
+    merge_groups: list[list[int]] = []
+
+    for want, sv in view_dims:
+        if want <= 1:
+            continue  # size-1 dim: nothing to merge
+
+        # Build a stride -> list-of-dim-index mapping over unclaimed dims.
+        stride_to_dims: dict[int, list[int]] = {}
+        for d in range(n_nonstick):
+            if not claimed[d]:
+                stride_to_dims.setdefault(stride_map[d], []).append(d)
+
+        if sv == 1:
+            # Chain starts from the stick boundary.
+            # The first contribution is the stick itself (size = stick_size,
+            # effective stride = 1).  Then we look for the non-stick dim with
+            # stride == stick_size, and so on.
+            product = stick_size
+            next_stride = stick_size
+        else:
+            product = 1
+            next_stride = sv
+
+        members: list[int] = []
+        while product < want:
+            hits = stride_to_dims.get(next_stride, [])
+            if len(hits) != 1:
+                break  # ambiguous or missing: cannot safely extend chain
+            d = hits[0]
+            members.append(d)
+            product *= device_size[d]
+            next_stride = product * sv  # next expected host stride
+
+        if product == want and len(members) >= 2:
+            # Sort by stride (innermost first) so the representative (members[0])
+            # carries the smallest stride — it becomes the merged dim.
+            members.sort(key=lambda d: stride_map[d])
+            merge_groups.append(members)
+            for d in members:
+                claimed[d] = True
+
+    if not merge_groups:
+        return stl
+
+    # Apply all merges.  Each group: keep members[0] (smallest stride),
+    # accumulate sizes from the rest, then delete the rest.
+    # Work from the highest index to the lowest to keep indices stable.
+    for group in merge_groups:
+        merged_sz = math.prod(device_size[d] for d in group)
+        rep = group[0]  # representative (smallest stride)
+        device_size[rep] = merged_sz
+        # Delete the non-representative members (highest index first).
+        for d in sorted(group[1:], reverse=True):
+            device_size.pop(d)
+            stride_map.pop(d)
 
     if list(stl.device_size) == device_size:
         return stl
