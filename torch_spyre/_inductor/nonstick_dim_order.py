@@ -488,9 +488,13 @@ def _merge_device_dims_for_view(
             continue  # size-1 dim: nothing to merge
 
         # Build a stride -> list-of-dim-index mapping over unclaimed dims.
+        # Size-1 dims are left out: their stride is arbitrary (e.g. the
+        # stick-split dim of a head_dim that fits one stick, ``[.., 1, 64]``,
+        # shares its stride with the dim next to it), so keeping them would make
+        # an otherwise unambiguous chain look ambiguous.
         stride_to_dims: dict[int, list[int]] = {}
         for d in range(n_nonstick):
-            if not claimed[d]:
+            if not claimed[d] and device_size[d] > 1:
                 stride_to_dims.setdefault(stride_map[d], []).append(d)
 
         if sv == 1:
@@ -525,23 +529,23 @@ def _merge_device_dims_for_view(
     if not merge_groups:
         return stl
 
-    # Apply all merges.  Each group: keep members[0] (smallest stride),
-    # accumulate sizes from the rest, then delete the rest.
-    # Work from the highest index to the lowest to keep indices stable.
+    # Apply all merges.  Each group keeps members[0] (smallest stride) with the
+    # product of the members' sizes; the rest are dropped.  Every index in
+    # ``merge_groups`` refers to the *original* layout, so all groups are
+    # applied to it first and the dropped dims are removed in a single pass.
+    # Popping while looping over the groups would shift the indices of every
+    # later group and corrupt the layout (e.g. fold a size into the stick dim).
+    dropped: set[int] = set()
     for group in merge_groups:
-        merged_sz = math.prod(device_size[d] for d in group)
-        rep = group[0]  # representative (smallest stride)
-        device_size[rep] = merged_sz
-        # Delete the non-representative members (highest index first).
-        for d in sorted(group[1:], reverse=True):
-            device_size.pop(d)
-            stride_map.pop(d)
+        # Groups are disjoint, so a group's members are still unmodified here.
+        device_size[group[0]] = math.prod(device_size[d] for d in group)
+        dropped.update(group[1:])
+    new_device_size = [s for d, s in enumerate(device_size) if d not in dropped]
+    new_stride_map = [s for d, s in enumerate(stride_map) if d not in dropped]
 
-    if list(stl.device_size) == device_size:
-        return stl
     return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=stride_map,
+        device_size=new_device_size,
+        stride_map=new_stride_map,
         device_dtype=stl.device_dtype,
     )
 

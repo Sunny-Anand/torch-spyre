@@ -191,7 +191,7 @@ class Test2DBase1DView(unittest.TestCase):
     _XFAIL_REASON = (
         "Spyre scatter engine operates on rows (sticks), not individual "
         "elements; element-granularity scatter into a fully-flat 1-D view "
-        "is unsupported at the hardware level (torch-spyre#5125 follow-up). "
+        "is unsupported at the hardware level (tracked separately from #5125). "
         "strict=True: an unexpected pass (XPASS) signals that hardware "
         "element-scatter has been added and this decorator should be removed. "
         "Note: subTest is intentionally NOT used here — pytest xfail + "

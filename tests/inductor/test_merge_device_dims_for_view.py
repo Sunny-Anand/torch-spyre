@@ -188,18 +188,22 @@ class TestMergeEdgeCases(unittest.TestCase):
     def test_3_dim_leading_merge(self):
         """Three non-stick dims in a contiguous chain collapse into one.
 
-        device_size=[16, 8, 4, 2, 64]  stride_map=[1024, 128, 32, 16, 1]
-        Chain for want=16*8*4=512, sv=32:
-          next_stride=32:   hit pos-2 (size=4)  -> product=4,   next=4*32=128
-          next_stride=128:  hit pos-1 (size=8)  -> product=32,  next=32*32=1024
-          next_stride=1024: hit pos-0 (size=16) -> product=512 == want ✓
+        Host shape [16, 8, 4, 128] → device_size=[16, 8, 4, 2, 64]
+        stride_map=[4096, 512, 128, 64, 1]  (stick-split stride=64, not 16).
+
+        Chain for want=16*8*4=512, sv=128:
+          next_stride=128:  hit pos-2 (size=4)  -> product=4,   next=4*128=512
+          next_stride=512:  hit pos-1 (size=8)  -> product=32,  next=32*128=4096
+          next_stride=4096: hit pos-0 (size=16) -> product=512 == want ✓
           members=[2,1,0] sorted by stride -> rep=pos-2 (smallest), merged_sz=4*8*16=512
-        Result: [512, 2, 64] (three dims merged into one; stick-split stays).
+        Result: [512, 2, 64]  stride_map=[128, 64, 1]
         """
-        stl = _stl([16, 8, 4, 2, 64], [1024, 128, 32, 16, 1])
-        view = _view([512, 32], [32, 1])
+        stl = _stl([16, 8, 4, 2, 64], [4096, 512, 128, 64, 1])
+        view = _view([512, 128], [128, 1])
         result = _merge_device_dims_for_view(stl, view)
         self.assertEqual(list(result.device_size), [512, 2, 64])
+        self.assertEqual(result.stride_map[-1], 1)  # stick stride unchanged
+        self.assertEqual(result.device_size[-1], 64)  # stick size unchanged
 
     def test_fully_flat_1d_view(self):
         """A 1-D view collapses all non-stick dims; device size = total_elems / stick_size.
@@ -225,8 +229,10 @@ class TestMergeEdgeCases(unittest.TestCase):
         self.assertEqual(list(result.device_size), [256, 64])
         self.assertEqual(len(result.device_size), 2)
 
-    def test_two_independent_merges(self):
-        """Two separate view dims each trigger their own independent merge.
+    def test_second_view_dim_has_nothing_to_merge(self):
+        """Only the first view dim merges; the second finds no chain to merge.
+
+        (Two view dims that *both* merge are covered by ``TestMergeMultipleGroups``.)
 
         device_size=[4, 8, 2, 64]  stride_map=[512, 64, 32, 1]
         View: [32, 128]  strides=[64, 1]
@@ -249,6 +255,66 @@ class TestMergeEdgeCases(unittest.TestCase):
         result = _merge_device_dims_for_view(stl, view)
         # pos-0(4) and pos-1(8) merged into 32; pos-2(2) and stick(64) unchanged.
         self.assertEqual(list(result.device_size), [32, 2, 64])
+
+
+class TestMergeMultipleGroups(unittest.TestCase):
+    """A view that flattens more than one group of dims at once.
+
+    Every merge group is computed against the original layout, so applying one
+    group must not shift the dims another group refers to.
+    """
+
+    def test_slot_and_trailing_dims_both_flatten(self):
+        """``[512, 16, 8, 128].view(8192, 1024)``: slots *and* heads x head_dim.
+
+        The slot dim merges the two block dims (512, 16) → 8192.
+        The trailing view dim (want=1024, sv=1) seeds from stick_size=64:
+          pos-3 (stick-split=2, stride=64) → product=128, next=128
+          pos-2 (heads=8, stride=128) → product=1024 == want ✓  → merge [3,2]
+        merged_sz = 2*8 = 16.  The stick stays at 64.
+        Result: device_size=[8192, 16, 64]  stride_map=[1024, 64, 1]
+        """
+        view = _view([8192, 1024], [1024, 1])
+        for name, stl in (
+            ("default", _stl([512, 16, 8, 2, 64], [16384, 1024, 128, 64, 1])),
+            ("hardware", _stl([16, 8, 2, 512, 64], [1024, 128, 64, 16384, 1])),
+        ):
+            with self.subTest(layout=name):
+                result = _merge_device_dims_for_view(stl, view)
+                self.assertEqual(list(result.device_size), [8192, 16, 64])
+                self.assertEqual(list(result.stride_map), [1024, 64, 1])
+
+    def test_two_leading_flattenings(self):
+        """``[4, 8, 2, 16, 128].view(32, 32, 128)``: (4, 8) and (2, 16) each merge."""
+        stl = _stl([4, 8, 2, 16, 2, 64], [32768, 4096, 2048, 128, 64, 1])
+        view = _view([32, 32, 128], [4096, 128, 1])
+        result = _merge_device_dims_for_view(stl, view)
+        self.assertEqual(list(result.device_size), [32, 32, 2, 64])
+        self.assertEqual(list(result.stride_map), [4096, 128, 64, 1])
+
+    def test_stick_size_is_never_changed(self):
+        """Whatever merges, the last (stick) dim keeps its size and stride 1."""
+        stl = _stl([512, 16, 8, 2, 64], [16384, 1024, 128, 64, 1])
+        result = _merge_device_dims_for_view(stl, _view([8192, 1024], [1024, 1]))
+        self.assertEqual(result.device_size[-1], 64)
+        self.assertEqual(result.stride_map[-1], 1)
+
+
+class TestMergeSizeOneDims(unittest.TestCase):
+    """A head_dim that fits one stick leaves a size-1 stick-split device dim."""
+
+    def test_size_1_stick_split_dim_does_not_block_the_merge(self):
+        """``[32, 16, 64].view(-1, 64)`` with device layout ``[32, 16, 1, 64]``.
+
+        The size-1 dim has the same stride (64) as the 16-dim, which would make
+        the stride lookup return two hits and stop the chain.  Size-1 dims are
+        excluded from the stride lookup to avoid this.
+        """
+        stl = _stl([32, 16, 1, 64], [1024, 64, 64, 1])
+        view = _view([512, 64], [64, 1])
+        result = _merge_device_dims_for_view(stl, view)
+        self.assertEqual(list(result.device_size), [512, 1, 64])
+        self.assertEqual(list(result.stride_map), [64, 64, 1])
 
 
 if __name__ == "__main__":
